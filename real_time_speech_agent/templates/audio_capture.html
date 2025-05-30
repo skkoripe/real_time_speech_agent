@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bentham Voice Assistant - Audio Capture</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+            width: 100%;
+            text-align: center;
+        }
+        .transcript, .audioInfo, .llmResponse {
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            width: 100%;
+            min-height: 100px;
+        }
+        .listening {
+            background-color: #ffecb3;
+        }
+        .idle {
+            background-color: #f5f5f5;
+        }
+        .error {
+            background-color: #ffebee;
+        }
+        .llmResponse {
+            background-color: #e8f5e9;  /* Light green background */
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Real-time Audio Transcription</h1>
+        
+        <div class="controls">
+            <button id="startButton">Start Recording</button>
+            <button id="stopButton" disabled>Stop Recording</button>
+        </div>
+        
+        <div id="status" class="status idle">Ready</div>
+        
+        <h2>Your Speech</h2>
+        <div id="transcript" class="transcript"></div>
+        
+        <h2>Bentham's Response</h2>
+        <div id="llmResponse" class="llmResponse"></div>
+        
+        <h2>Audio Data</h2>
+        <div id="audioInfo" class="audioInfo"></div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log("DOM fully loaded and parsed");
+            
+            let mediaRecorder;
+            let audioChunks = [];
+            let websocket;
+            let audioContext;
+            let audioProcessor;
+            let audioQueue = [];
+            let isPlayingAudio = false;
+            let userIsSpeaking = false;
+            let speechDetectionThreshold = 0.02; // Reduced threshold for more sensitivity
+            let speechFrameCount = 0; // Counter for consecutive speech frames
+            
+            const startButton = document.getElementById('startButton');
+            const stopButton = document.getElementById('stopButton');
+            const status = document.getElementById('status');
+            const transcript = document.getElementById('transcript');
+            const llmResponse = document.getElementById('llmResponse');
+            const audioInfo = document.getElementById('audioInfo');
+            
+            // Function to create a WAV header for PCM data
+            function createWavHeader(dataLength, sampleRate, numChannels, bitsPerSample) {
+                const headerLength = 44;
+                const header = new Uint8Array(headerLength);
+                
+                // RIFF chunk descriptor
+                writeString(header, 0, 'RIFF');
+                writeUint32(header, 4, 36 + dataLength);
+                writeString(header, 8, 'WAVE');
+                
+                // fmt sub-chunk
+                writeString(header, 12, 'fmt ');
+                writeUint32(header, 16, 16); // subchunk1Size
+                writeUint16(header, 20, 1); // audioFormat (PCM)
+                writeUint16(header, 22, numChannels);
+                writeUint32(header, 24, sampleRate);
+                writeUint32(header, 28, sampleRate * numChannels * bitsPerSample / 8); // byteRate
+                writeUint16(header, 32, numChannels * bitsPerSample / 8); // blockAlign
+                writeUint16(header, 34, bitsPerSample);
+                
+                // data sub-chunk
+                writeString(header, 36, 'data');
+                writeUint32(header, 40, dataLength);
+                
+                return header;
+            }
+
+            function writeString(dataView, offset, string) {
+                for (let i = 0; i < string.length; i++) {
+                    dataView[offset + i] = string.charCodeAt(i);
+                }
+            }
+
+            function writeUint32(dataView, offset, value) {
+                dataView[offset] = value & 0xFF;
+                dataView[offset + 1] = (value >> 8) & 0xFF;
+                dataView[offset + 2] = (value >> 16) & 0xFF;
+                dataView[offset + 3] = (value >> 24) & 0xFF;
+            }
+
+            function writeUint16(dataView, offset, value) {
+                dataView[offset] = value & 0xFF;
+                dataView[offset + 1] = (value >> 8) & 0xFF;
+            }
+            
+            // Function to play the next audio in queue
+            function playNextAudio() {
+                if (audioQueue.length === 0) {
+                    isPlayingAudio = false;
+                    return;
+                }
+                
+                isPlayingAudio = true;
+                const audioUrl = audioQueue.shift();
+                const audio = new Audio();
+                
+                audio.onended = function() {
+                    // When this audio finishes, play the next one
+                    console.log('Audio playback ended, playing next in queue');
+                    playNextAudio();
+                };
+                
+                audio.onerror = function(e) {
+                    console.error('Error playing audio:', e);
+                    // Even on error, try to continue with the next audio
+                    playNextAudio();
+                };
+                
+                audio.src = audioUrl;
+                audio.play().catch(e => {
+                    console.error('Error starting audio playback:', e);
+                    playNextAudio(); // Try the next audio on error
+                });
+            }
+            
+            // Function to stop all audio playback
+            function stopAllAudio() {
+                // Clear the audio queue
+                audioQueue = [];
+                
+                // If there's an audio element playing, stop it
+                const audioElements = document.querySelectorAll('audio');
+                audioElements.forEach(audio => {
+                    audio.pause();
+                    audio.currentTime = 0;
+                });
+                
+                isPlayingAudio = false;
+                console.log("All audio playback stopped");
+            }
+            
+            // Start recording with WebSocket streaming
+            startButton.addEventListener('click', async () => {
+                console.log("Start button clicked");
+                try {
+                    // Check if MediaDevices API is available
+                    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                        console.error("MediaDevices API not available");
+                        throw new Error("Your browser doesn't support audio recording. Please try Chrome or Firefox.");
+                    }
+                    console.log("MediaDevices API available");
+                    
+                    // Clear previous results
+                    transcript.textContent = '';
+                    llmResponse.textContent = '';
+                    audioInfo.textContent = '';
+                    audioChunks = [];
+                    
+                    // Clear audio queue
+                    audioQueue = [];
+                    isPlayingAudio = false;
+                    
+                    // Update UI
+                    startButton.disabled = true;
+                    stopButton.disabled = false;
+                    status.textContent = 'Recording...';
+                    status.className = 'status listening';
+                    
+                    // Create WebSocket connection
+                    websocket = new WebSocket(`ws://${window.location.host}/ws/audio`);
+                    
+                    websocket.onopen = async () => {
+                        console.log("WebSocket connection established");
+                        
+                        // Get microphone access
+                        console.log("Requesting microphone access");
+                        const stream = await navigator.mediaDevices.getUserMedia({ 
+                            audio: {
+                                channelCount: 1,
+                                sampleRate: 16000,
+                                sampleSize: 16,
+                                echoCancellation: true,
+                                noiseSuppression: true
+                            } 
+                        });
+                        console.log("Microphone access granted");
+                        
+                        // Initialize AudioContext for processing
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                            sampleRate: 16000
+                        });
+                        
+                        // Create source from microphone stream
+                        const source = audioContext.createMediaStreamSource(stream);
+                        
+                        // Create script processor for raw PCM data
+                        const bufferSize = 8192;  // Increased buffer size for more context
+                        audioProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+                        
+                        // Process audio data
+                        audioProcessor.onaudioprocess = function(e) {
+                            const inputData = e.inputBuffer.getChannelData(0);
+                            
+                            // Calculate RMS (root mean square) for better speech detection
+                            let rms = 0;
+                            for (let i = 0; i < inputData.length; i++) {
+                                rms += inputData[i] * inputData[i];
+                            }
+                            rms = Math.sqrt(rms / inputData.length);
+                            
+                            // If RMS exceeds threshold, consider it speech
+                            if (rms > speechDetectionThreshold) {
+                                // Count consecutive frames above threshold
+                                speechFrameCount++;
+                                
+                                // Require multiple consecutive frames to avoid false triggers
+                                if (speechFrameCount >= 3 && isPlayingAudio) {
+                                    console.log("User started speaking, stopping assistant audio");
+                                    
+                                    // Stop all audio playback
+                                    stopAllAudio();
+                                    
+                                    // Send a signal to the server that user interrupted
+                                    if (websocket && websocket.readyState === WebSocket.OPEN) {
+                                        try {
+                                            const interruptMessage = JSON.stringify({
+                                                type: "user_interrupt"
+                                            });
+                                            console.log("Sending interrupt message:", interruptMessage);
+                                            websocket.send(interruptMessage);
+                                        } catch (e) {
+                                            console.error("Error sending interrupt message:", e);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Reset counter when below threshold
+                                speechFrameCount = 0;
+                            }
+                            
+                            // Convert to 16-bit PCM
+                            const pcmData = new Int16Array(inputData.length);
+                            for (let i = 0; i < inputData.length; i++) {
+                                pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                            }
+                            
+                            // Send PCM data to server
+                            if (websocket.readyState === WebSocket.OPEN) {
+                                websocket.send(pcmData.buffer);
+                                
+                                // Update audio info
+                                audioInfo.textContent = `Sending audio data: ${pcmData.length * 2} bytes, min: ${Math.min(...pcmData)}, max: ${Math.max(...pcmData)}, RMS: ${rms.toFixed(4)}`;
+                            }
+                        };
+                        
+                        // Connect the audio nodes
+                        source.connect(audioProcessor);
+                        audioProcessor.connect(audioContext.destination);
+                        
+                        // Handle WebSocket messages (transcriptions, LLM responses, and audio responses)
+                        websocket.onmessage = (event) => {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'transcription') {
+                                console.log('Received transcription:', data.text);
+                                
+                                // Check if we have a complete transcript
+                                if (data.complete_transcript) {
+                                    console.log('Complete transcript:', data.complete_transcript);
+                                    transcript.textContent = data.complete_transcript;
+                                } else {
+                                    // Fallback to just appending the current text
+                                    transcript.textContent += (transcript.textContent ? ' ' : '') + data.text;
+                                }
+                            } else if (data.type === 'llm_response') {
+                                console.log('Received LLM response chunk:', data.text);
+                                llmResponse.textContent += data.text;
+                            } else if (data.type === 'audio_response') {
+                                console.log('Received audio response, data length:', data.data.length);
+                                
+                                try {
+                                    // Decode base64 audio data
+                                    const binaryString = atob(data.data);
+                                    const len = binaryString.length;
+                                    const bytes = new Uint8Array(len);
+                                    for (let i = 0; i < len; i++) {
+                                        bytes[i] = binaryString.charCodeAt(i);
+                                    }
+                                    
+                                    // For PCM data, we need to convert it to WAV format
+                                    // which browsers can play natively
+                                    const wavHeader = createWavHeader(bytes.length, 16000, 1, 16);
+                                    const wavData = new Uint8Array(wavHeader.length + bytes.length);
+                                    wavData.set(wavHeader);
+                                    wavData.set(bytes, wavHeader.length);
+                                    
+                                    // Create a blob with the WAV data
+                                    const blob = new Blob([wavData], { type: 'audio/wav' });
+                                    const audioUrl = URL.createObjectURL(blob);
+                                    
+                                    // Add to queue instead of playing immediately
+                                    audioQueue.push(audioUrl);
+                                    console.log('Added audio to queue, queue length:', audioQueue.length);
+                                    
+                                    // Start playing if not already playing
+                                    if (!isPlayingAudio) {
+                                        console.log('Starting audio playback queue');
+                                        playNextAudio();
+                                    }
+                                } catch (error) {
+                                    console.error('Error processing audio response:', error);
+                                }
+                            } else if (data.type === 'clear_audio_queue') {
+                                console.log('Received clear audio queue command');
+                                stopAllAudio();
+                            } else if (data.type === 'clear_llm_response') {
+                                console.log('Clearing LLM response');
+                                llmResponse.textContent = '';
+                            } else if (data.error) {
+                                console.error('Server error:', data.error);
+                                status.textContent = 'Error: ' + data.error;
+                                status.className = 'status error';
+                            }
+                        };
+                        
+                        // Create media recorder for recording backup
+                        console.log("Creating MediaRecorder");
+                        try {
+                            const options = { mimeType: 'audio/webm;codecs=pcm' };
+                            mediaRecorder = new MediaRecorder(stream, options);
+                        } catch (e) {
+                            console.log("PCM codec not supported, falling back to default codec");
+                            mediaRecorder = new MediaRecorder(stream);
+                        }
+                        
+                        // Handle data available event - store chunks for playback
+                        mediaRecorder.ondataavailable = (event) => {
+                            if (event.data.size > 0) {
+                                console.log(`Audio data available: ${event.data.size} bytes`);
+                                audioChunks.push(event.data);
+                            }
+                        };
+                        
+                        // Start recording
+                        console.log("Starting MediaRecorder");
+                        mediaRecorder.start(1000); // 1-second chunks for recording
+                        console.log("MediaRecorder started");
+                    };
+                    
+                    websocket.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        status.textContent = 'WebSocket error';
+                        status.className = 'status error';
+                        startButton.disabled = false;
+                        stopButton.disabled = true;
+                    };
+                    
+                    websocket.onclose = () => {
+                        console.log('WebSocket connection closed');
+                    };
+                    
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    status.textContent = 'Error: ' + error.message;
+                    status.className = 'status error';
+                    startButton.disabled = false;
+                }
+            });
+            
+            // Stop recording
+            stopButton.addEventListener('click', () => {
+                console.log("Stop button clicked");
+                
+                // Stop audio processing
+                if (audioProcessor) {
+                    audioProcessor.disconnect();
+                    audioProcessor = null;
+                }
+                
+                // Stop audio context
+                if (audioContext) {
+                    audioContext.close();
+                    audioContext = null;
+                }
+                
+                // Stop media recorder
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    console.log("Stopping MediaRecorder");
+                    mediaRecorder.stop();
+                    mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                    console.log("MediaRecorder and tracks stopped");
+                }
+                
+                // Close WebSocket
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    console.log("Closing WebSocket connection");
+                    websocket.close();
+                }
+                
+                // Create audio blob for playback
+                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                console.log(`Recording complete: ${(audioBlob.size / 1024).toFixed(2)} KB`);
+                
+                // Create audio element to play back the recording
+                const audioURL = URL.createObjectURL(audioBlob);
+                const audio = document.createElement('audio');
+                audio.src = audioURL;
+                audio.controls = true;
+                audioInfo.innerHTML = '';
+                audioInfo.appendChild(audio);
+                
+                // Create download link
+                const downloadLink = document.createElement('a');
+                downloadLink.href = audioURL;
+                downloadLink.download = 'recording.webm';
+                downloadLink.innerHTML = '<br>Download Recording';
+                audioInfo.appendChild(downloadLink);
+                
+                // Update UI
+                status.textContent = 'Recording complete';
+                status.className = 'status idle';
+                startButton.disabled = false;
+                stopButton.disabled = true;
+            });
+        });
+    </script>
+</body>
+</html>
