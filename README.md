@@ -10,9 +10,8 @@ Real-Time Speech Agent provides a web-based interface for interacting with an AI
 - Speech-to-text transcription using Moonshine STT
 - Processing text with a large language model (Amazon Bedrock)
 - Text-to-speech synthesis using Amazon Polly
-- Barge-in capability for natural conversation flow
 
-This package is built on top of the Bentham Voice API framework and provides a ready-to-use web application for voice-based legal assistant interactions.
+This package provides a ready-to-use web application for voice-based legal assistant interactions.
 
 ## Features
 
@@ -20,7 +19,6 @@ This package is built on top of the Bentham Voice API framework and provides a r
 - Streaming LLM processing for natural language understanding
 - Real-time streaming text-to-speech synthesis
 - Web interface for browser-based voice interactions
-- Barge-in capability (interrupt the assistant while it's speaking)
 - Voice activity detection for determining when speech starts and ends
 - Configurable system prompt for the AI assistant
 
